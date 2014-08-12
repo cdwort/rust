@@ -8,14 +8,19 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-
-use std::gc::GC;
-
-fn f<T:'static>(_: T) {}
-
-fn main() {
-    let x = box(GC) 3i;
-    f(x);
-    let x = &3i; //~ ERROR borrowed value does not live long enough
-    f(x);
+fn borrowed_proc<'a>(x: &'a int) -> proc():'a -> int {
+    // This is legal, because the region bound on `proc`
+    // states that it captures `x`.
+    proc() {
+        *x
+    }
 }
+
+fn static_proc<'a>(x: &'a int) -> proc():'static -> int {
+    // This is illegal, because the region bound on `proc` is 'static.
+    proc() { //~ ERROR captured variable `x` outlives the `proc()`
+        *x
+    }
+}
+
+fn main() { }
