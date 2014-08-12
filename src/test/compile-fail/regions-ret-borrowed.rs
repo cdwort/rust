@@ -20,9 +20,11 @@ fn with<R>(f: |x: &int| -> R) -> R {
 }
 
 fn return_it<'a>() -> &'a int {
-    with(|o| o) //~ ERROR mismatched types
-        //~^ ERROR lifetime of return value does not outlive the function call
-        //~^^ ERROR cannot infer
+    with(|o| o)
+        //~^ ERROR cannot infer
+        //~^^ ERROR mismatched types
+        //~^^^ ERROR not valid during the expression
+        //~^^^^ ERROR not valid at this point
 }
 
 fn main() {
