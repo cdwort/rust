@@ -298,7 +298,7 @@ pub fn blank_fn_ctxt<'a>(
     }
 }
 
-fn blank_inherited_fields<'a>(ccx: &'a CrateCtxt<'a>) -> Inherited<'a> {
+fn static_inherited_fields<'a>(ccx: &'a CrateCtxt<'a>) -> Inherited<'a> {
     // It's kind of a kludge to manufacture a fake function context
     // and statement context, but we might as well do write the code only once
     let param_env = ty::ParameterEnvironment {
@@ -316,6 +316,15 @@ impl<'a> ExprTyProvider for FnCtxt<'a> {
 
     fn ty_ctxt<'a>(&'a self) -> &'a ty::ctxt {
         self.ccx.tcx
+    }
+}
+
+struct CheckTypeWellFormedVisitor<'a> { ccx: &'a CrateCtxt<'a> }
+
+impl<'a> Visitor<()> for CheckTypeWellFormedVisitor<'a> {
+    fn visit_item(&mut self, i: &ast::Item, _: ()) {
+        check_type_well_formed(self.ccx, i);
+        visit::walk_item(self, i, ());
     }
 }
 
@@ -338,6 +347,13 @@ impl<'a> Visitor<()> for CheckItemSizedTypesVisitor<'a> {
 }
 
 pub fn check_item_types(ccx: &CrateCtxt, krate: &ast::Crate) {
+    let mut visit = CheckTypeWellFormedVisitor { ccx: ccx };
+    visit::walk_crate(&mut visit, krate, ());
+
+    // If types are not well-formed, it leads to all manner of errors
+    // downstream, so stop reporting errors at this point.
+    ccx.tcx.sess.abort_if_errors();
+
     let mut visit = CheckItemTypesVisitor { ccx: ccx };
     visit::walk_crate(&mut visit, krate, ());
 
@@ -650,6 +666,71 @@ pub fn check_struct(ccx: &CrateCtxt, id: ast::NodeId, span: Span) {
 
     if ty::lookup_simd(tcx, local_def(id)) {
         check_simd(tcx, span, id);
+    }
+}
+
+fn check_type_well_formed(ccx: &CrateCtxt, item: &ast::Item) {
+    /*!
+     * Checks that the field types (in a struct def'n) or
+     * argument types (in an enum def'n) are well-formed,
+     * meaning that they do not require any constraints not
+     * declared in the struct definition itself.
+     * For example, this definition would be illegal:
+     *
+     *     struct Ref<'a, T> { x: &'a T }
+     *
+     * because the type did not declare that `T:'a`.
+     *
+     * We do this check as a pre-pass before checking fn bodies
+     * because if these constraints are not included it frequently
+     * leads to confusing errors in fn bodies. So it's better to check
+     * the types first.
+     */
+
+    debug!("check_type_well_formed(it.id={}, it.ident={})",
+           item.id,
+           ty::item_path_str(ccx.tcx, local_def(item.id)));
+
+    match item.node {
+        ast::ItemStruct(..) => {
+            check_type_defn(ccx, item, |fcx| {
+                ty::struct_fields(ccx.tcx, local_def(item.id),
+                                  &fcx.inh.param_env.free_substs)
+                    .iter()
+                    .map(|f| f.mt.ty)
+                    .collect()
+            });
+        }
+        ast::ItemEnum(..) => {
+            check_type_defn(ccx, item, |fcx| {
+                ty::substd_enum_variants(ccx.tcx, local_def(item.id),
+                                         &fcx.inh.param_env.free_substs)
+                    .iter()
+                    .flat_map(|variant| {
+                        variant.args
+                            .iter()
+                            .map(|&arg_ty| arg_ty)
+                    })
+                    .collect()
+            });
+        }
+        _ => {}
+    }
+
+    fn check_type_defn(ccx: &CrateCtxt,
+                       item: &ast::Item,
+                       lookup_fields: |&FnCtxt| -> Vec<ty::t>)
+    {
+        let item_def_id = local_def(item.id);
+        let polytype = ty::lookup_item_type(ccx.tcx, item_def_id);
+        let param_env =
+            ty::construct_parameter_environment(ccx.tcx,
+                                                &polytype.generics,
+                                                item.id);
+        let inh = Inherited::new(ccx.tcx, param_env);
+        let fcx = blank_fn_ctxt(ccx, &inh, polytype.ty, item.id);
+        let field_tys = lookup_fields(&fcx);
+        regionck::regionck_type_defn(&fcx, item.span, field_tys.as_slice());
     }
 }
 
@@ -4145,7 +4226,7 @@ pub fn check_const_in_type(tcx: &ty::ctxt,
         trait_map: NodeMap::new(),
         tcx: tcx,
     };
-    let inh = blank_inherited_fields(&ccx);
+    let inh = static_inherited_fields(&ccx);
     let fcx = blank_fn_ctxt(&ccx, &inh, expected_type, expr.id);
     check_const_with_ty(&fcx, expr.span, expr, expected_type);
 }
@@ -4154,7 +4235,7 @@ pub fn check_const(ccx: &CrateCtxt,
                    sp: Span,
                    e: &ast::Expr,
                    id: ast::NodeId) {
-    let inh = blank_inherited_fields(ccx);
+    let inh = static_inherited_fields(ccx);
     let rty = ty::node_id_to_type(ccx.tcx, id);
     let fcx = blank_fn_ctxt(ccx, &inh, rty, e.id);
     let declty = fcx.ccx.tcx.tcache.borrow().get(&local_def(id)).ty;
@@ -4349,7 +4430,7 @@ pub fn check_enum_variants(ccx: &CrateCtxt,
                 Some(e) => {
                     debug!("disr expr, checking {}", pprust::expr_to_string(&*e));
 
-                    let inh = blank_inherited_fields(ccx);
+                    let inh = static_inherited_fields(ccx);
                     let fcx = blank_fn_ctxt(ccx, &inh, rty, e.id);
                     let declty = match hint {
                         attr::ReprAny | attr::ReprExtern => ty::mk_int(),
