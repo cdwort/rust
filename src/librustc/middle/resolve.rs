@@ -901,7 +901,7 @@ struct Resolver<'a> {
     used_imports: HashSet<(NodeId, Namespace)>,
 }
 
-struct BuildReducedGraphVisitor<'a, 'b> {
+struct BuildReducedGraphVisitor<'a, 'b:'a> {
     resolver: &'a mut Resolver<'b>,
 }
 
@@ -933,7 +933,9 @@ impl<'a, 'b> Visitor<ReducedGraphParent> for BuildReducedGraphVisitor<'a, 'b> {
 
 }
 
-struct UnusedImportCheckVisitor<'a, 'b> { resolver: &'a mut Resolver<'b> }
+struct UnusedImportCheckVisitor<'a, 'b:'a> {
+    resolver: &'a mut Resolver<'b>
+}
 
 impl<'a, 'b> Visitor<()> for UnusedImportCheckVisitor<'a, 'b> {
     fn visit_view_item(&mut self, vi: &ViewItem, _: ()) {
