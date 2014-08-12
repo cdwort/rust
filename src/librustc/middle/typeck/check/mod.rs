@@ -99,7 +99,6 @@ use middle::typeck::check::method::{CheckTraitsAndInherentMethods};
 use middle::typeck::check::method::{DontAutoderefReceiver};
 use middle::typeck::check::method::{IgnoreStaticMethods, ReportStaticMethods};
 use middle::typeck::check::regionmanip::replace_late_bound_regions_in_fn_sig;
-use middle::typeck::check::regionmanip::relate_free_regions;
 use middle::typeck::check::vtable::VtableContext;
 use middle::typeck::CrateCtxt;
 use middle::typeck::infer::{resolve_type, force_tvar};
@@ -169,6 +168,43 @@ pub struct Inherited<'a> {
     vtable_map: vtable_map,
     upvar_borrow_map: RefCell<ty::UpvarBorrowMap>,
     unboxed_closures: RefCell<DefIdMap<ty::UnboxedClosure>>,
+
+    // A mapping from each fn's id to its signature, with all bound
+    // regions replaced with free ones. Unlike the other tables, this
+    // one is never copied into the tcx: it is only used by regionck.
+    fn_sig_map: RefCell<NodeMap<Vec<ty::t>>>,
+
+    // A set of constraints that regionck must validate. Each
+    // constraint has the form `T:'a`, meaning "some type `T` must
+    // outlive the lifetime 'a". These constraints derive from
+    // instantiated type parameters. So if you had a struct defined
+    // like
+    //
+    //     struct Foo<T:'static> { ... }
+    //
+    // then in some expression `let x = Foo { ... }` it will
+    // instantiate the type parameter `T` with a fresh type `$0`. At
+    // the same time, it will record a region obligation of
+    // `$0:'static`. This will get checked later by regionck.  (We
+    // can't generally check these things right away because we have
+    // to wait until types are resolved.)
+    //
+    // These are stored in a map keyed to the id of the innermost
+    // enclosing fn body / static initializer expression. This is
+    // because the location where the obligation was incurred can be
+    // relevant with respect to which sublifetime assumptions are in
+    // place. The reason that we store under the fn-id, and not
+    // something more fine-grained, is so that it is easier for
+    // regionck to be sure that it has found *all* the region
+    // obligations (otherwise, it's easy to fail to walk to a
+    // particular node-id).
+    region_obligations: RefCell<NodeMap<Vec<RegionObligation>>>,
+}
+
+struct RegionObligation {
+    sub_region: ty::Region,
+    sup_type: ty::t,
+    origin: infer::SubregionOrigin,
 }
 
 /// When type-checking an expression, we propagate downward
@@ -228,6 +264,8 @@ enum IsBinopAssignment{
 
 #[deriving(Clone)]
 pub struct FnCtxt<'a> {
+    body_id: ast::NodeId,
+
     // This flag is set to true if, during the writeback phase, we encounter
     // a type error in this function.
     writeback_errors: Cell<bool>,
@@ -239,22 +277,8 @@ pub struct FnCtxt<'a> {
     err_count_on_creation: uint,
 
     ret_ty: ty::t,
-    ps: RefCell<FnStyleState>,
 
-    // Sometimes we generate region pointers where the precise region
-    // to use is not known. For example, an expression like `&x.f`
-    // where `x` is of type `@T`: in this case, we will be rooting
-    // `x` onto the stack frame, and we could choose to root it until
-    // the end of (almost) any enclosing block or expression.  We
-    // want to pick the narrowest block that encompasses all uses.
-    //
-    // What we do in such cases is to generate a region variable with
-    // `region_lb` as a lower bound.  The regionck pass then adds
-    // other constraints based on how the variable is used and region
-    // inference selects the ultimate value.  Finally, borrowck is
-    // charged with guaranteeing that the value whose address was taken
-    // can actually be made to live as long as it needs to live.
-    region_lb: Cell<ast::NodeId>,
+    ps: RefCell<FnStyleState>,
 
     inh: &'a Inherited<'a>,
 
@@ -276,6 +300,8 @@ impl<'a> Inherited<'a> {
             vtable_map: RefCell::new(FnvHashMap::new()),
             upvar_borrow_map: RefCell::new(HashMap::new()),
             unboxed_closures: RefCell::new(DefIdMap::new()),
+            fn_sig_map: RefCell::new(NodeMap::new()),
+            region_obligations: RefCell::new(NodeMap::new()),
         }
     }
 }
@@ -285,14 +311,14 @@ pub fn blank_fn_ctxt<'a>(
                      ccx: &'a CrateCtxt<'a>,
                      inh: &'a Inherited<'a>,
                      rty: ty::t,
-                     region_bnd: ast::NodeId)
+                     body_id: ast::NodeId)
                      -> FnCtxt<'a> {
     FnCtxt {
+        body_id: body_id,
         writeback_errors: Cell::new(false),
         err_count_on_creation: ccx.tcx.sess.err_count(),
         ret_ty: rty,
         ps: RefCell::new(FnStyleState::function(ast::NormalFn, 0)),
-        region_lb: Cell::new(region_bnd),
         inh: inh,
         ccx: ccx
     }
@@ -376,11 +402,11 @@ fn check_bare_fn(ccx: &CrateCtxt,
     match ty::get(fty).sty {
         ty::ty_bare_fn(ref fn_ty) => {
             let inh = Inherited::new(ccx.tcx, param_env);
-            let fcx = check_fn(ccx, fn_ty.fn_style, &fn_ty.sig,
+            let fcx = check_fn(ccx, fn_ty.fn_style, id, &fn_ty.sig,
                                decl, id, body, &inh);
 
             vtable::resolve_in_block(&fcx, body);
-            regionck::regionck_fn(&fcx, body);
+            regionck::regionck_fn(&fcx, id, body);
             writeback::resolve_type_vars_in_fn(&fcx, decl, body);
         }
         _ => ccx.tcx.sess.impossible_case(body.span,
@@ -445,7 +471,7 @@ impl<'a> Visitor<()> for GatherLocalsVisitor<'a> {
         // non-obvious: the `blk` variable maps to region lb, so
         // we have to keep this up-to-date.  This
         // is... unfortunate.  It'd be nice to not need this.
-        self.fcx.with_region_lb(b.id, || visit::walk_block(self, b, ()));
+        visit::walk_block(self, b, ());
     }
 
     // Since an expr occurs as part of the type fixed size arrays we
@@ -467,13 +493,16 @@ impl<'a> Visitor<()> for GatherLocalsVisitor<'a> {
 
 }
 
-fn check_fn<'a>(ccx: &'a CrateCtxt<'a>,
-                fn_style: ast::FnStyle,
-                fn_sig: &ty::FnSig,
-                decl: &ast::FnDecl,
-                id: ast::NodeId,
-                body: &ast::Block,
-                inherited: &'a Inherited<'a>) -> FnCtxt<'a>
+fn check_fn<'a>(
+    ccx: &'a CrateCtxt<'a>,
+    fn_style: ast::FnStyle,
+    fn_style_id: ast::NodeId,
+    fn_sig: &ty::FnSig,
+    decl: &ast::FnDecl,
+    fn_id: ast::NodeId,
+    body: &ast::Block,
+    inherited: &'a Inherited<'a>)
+    -> FnCtxt<'a>
 {
     /*!
      * Helper used by check_bare_fn and check_expr_fn.  Does the
@@ -1530,6 +1559,8 @@ impl<'a> AstConv for FnCtxt<'a> {
 }
 
 impl<'a> FnCtxt<'a> {
+    fn tcx<'a>(&'a self) -> &'a ty::ctxt { self.ccx.tcx }
+
     pub fn infcx<'b>(&'b self) -> &'b infer::InferCtxt<'a> {
         &self.inh.infcx
     }
@@ -1759,6 +1790,112 @@ impl<'a> FnCtxt<'a> {
                                    a: ty::t,
                                    err: &ty::type_err) {
         self.infcx().report_mismatched_types(sp, e, a, err)
+    }
+
+    pub fn register_region_obligation(&self,
+                                      origin: infer::SubregionOrigin,
+                                      ty: ty::t,
+                                      r: ty::Region)
+    {
+        /*!
+         * Registers an obligation for checking later, during
+         * regionck, that the type `ty` must outlive the region `r`.
+         */
+
+        let mut region_obligations = self.inh.region_obligations.borrow_mut();
+        let v = region_obligations.find_or_insert_with(self.body_id,
+                                                       |_| Vec::new());
+        v.push(RegionObligation { sub_region: r,
+                                  sup_type: ty,
+                                  origin: origin });
+    }
+
+    pub fn add_region_obligations_for_parameters(&self,
+                                                 span: Span,
+                                                 substs: &Substs,
+                                                 generics: &ty::Generics)
+    {
+        /*!
+         * Given a set of generic parameter definitions (`generics`)
+         * and the values provided for each of them (`substs`),
+         * creates and registers suitable region obligations.
+         *
+         * For example, if there is a function:
+         *
+         *    fn foo<'a,T:'a>(...)
+         *
+         * and a reference:
+         *
+         *    let f = foo;
+         *
+         * Then we will create a fresh region variable `'$0` and a
+         * fresh type variable `$1` for `'a` and `T`. This routine
+         * will add a region obligation `$1:'$0` and register it
+         * locally.
+         */
+
+        debug!("add_region_obligations_for_parameters(substs={}, generics={})",
+               substs.repr(self.tcx()),
+               generics.repr(self.tcx()));
+
+        assert_eq!(generics.types.iter().len(),
+                   substs.types.iter().len());
+        for (type_def, &type_param) in
+            generics.types.iter().zip(
+                substs.types.iter())
+        {
+            let param_ty = ty::ParamTy { space: type_def.space,
+                                         idx: type_def.index,
+                                         def_id: type_def.def_id };
+            let bounds = type_def.bounds.subst(self.tcx(), substs);
+            add_region_obligations_for_type_parameter(
+                self, span, param_ty, &bounds, type_param);
+        }
+
+        assert_eq!(generics.regions.iter().len(),
+                   substs.regions().iter().len());
+        for (region_def, &region_param) in
+            generics.regions.iter().zip(
+                substs.regions().iter())
+        {
+            let bounds = region_def.bounds.subst(self.tcx(), substs);
+            add_region_obligations_for_region_parameter(
+                self, span, bounds.as_slice(), region_param);
+        }
+
+        fn add_region_obligations_for_type_parameter(
+            fcx: &FnCtxt,
+            span: Span,
+            param_ty: ty::ParamTy,
+            param_bound: &ty::ParamBounds,
+            ty: ty::t)
+        {
+            // For each declared region bound `T:r`, `T` must outlive `r`.
+            let region_bounds =
+                ty::required_region_bounds(
+                    fcx.tcx(),
+                    param_bound.opt_region_bound.as_slice(),
+                    param_bound.builtin_bounds,
+                    param_bound.trait_bounds.as_slice());
+            for &r in region_bounds.iter() {
+                let origin = infer::RelateParamBound(span, param_ty, ty);
+                fcx.register_region_obligation(origin, ty, r);
+            }
+        }
+
+        fn add_region_obligations_for_region_parameter(
+            fcx: &FnCtxt,
+            span: Span,
+            region_bounds: &[ty::Region],
+            region_param: ty::Region)
+        {
+            for &b in region_bounds.iter() {
+                // For each bound `region:b`, `b <= region` must hold
+                // (i.e., `region` must outlive `b`).
+                let origin = infer::RelateRegionParamBound(span);
+                fcx.mk_subr(origin, b, region_param);
+            }
+        }
     }
 }
 
@@ -2919,6 +3056,7 @@ fn check_expr_with_unifier(fcx: &FnCtxt,
 
         check_fn(fcx.ccx,
                  ast::NormalFn,
+                 expr.id,
                  &fn_ty.sig,
                  decl,
                  expr.id,
@@ -3024,7 +3162,7 @@ fn check_expr_with_unifier(fcx: &FnCtxt,
         // If the closure is a stack closure and hasn't had some non-standard
         // style inferred for it, then check it under its parent's style.
         // Otherwise, use its own
-        let (inherited_style, id) = match store {
+        let (inherited_style, inherited_style_id) = match store {
             ty::RegionTraitStore(..) => (fcx.ps.borrow().fn_style,
                                          fcx.ps.borrow().def),
             ty::UniqTraitStore => (ast::NormalFn, expr.id)
@@ -3032,9 +3170,10 @@ fn check_expr_with_unifier(fcx: &FnCtxt,
 
         check_fn(fcx.ccx,
                  inherited_style,
+                 inherited_style_id,
                  &fty_sig,
-                 decl,
-                 id,
+                 &*decl,
+                 expr.id,
                  &*body,
                  fcx.inh);
     }
@@ -3383,13 +3522,15 @@ fn check_expr_with_unifier(fcx: &FnCtxt,
                   // places: the exchange heap and the managed heap.
                   let definition = lookup_def(fcx, path.span, place.id);
                   let def_id = definition.def_id();
+                  let referent_ty = fcx.expr_ty(&**subexpr);
                   if tcx.lang_items.exchange_heap() == Some(def_id) {
-                      fcx.write_ty(id, ty::mk_uniq(tcx,
-                                                   fcx.expr_ty(&**subexpr)));
+                      fcx.write_ty(id, ty::mk_uniq(tcx, referent_ty));
                       checked = true
                   } else if tcx.lang_items.managed_heap() == Some(def_id) {
-                      fcx.write_ty(id, ty::mk_box(tcx,
-                                                  fcx.expr_ty(&**subexpr)));
+                      fcx.register_region_obligation(infer::Managed(expr.span),
+                                                     referent_ty,
+                                                     ty::ReStatic);
+                      fcx.write_ty(id, ty::mk_box(tcx, referent_ty));
                       checked = true
                   }
               }
@@ -4143,72 +4284,64 @@ fn check_block_with_expected(fcx: &FnCtxt,
         replace(&mut *fcx_ps, fn_style_state)
     };
 
-    fcx.with_region_lb(blk.id, || {
-        let mut warned = false;
-        let mut last_was_bot = false;
-        let mut any_bot = false;
-        let mut any_err = false;
-        for s in blk.stmts.iter() {
-            check_stmt(fcx, &**s);
-            let s_id = ast_util::stmt_id(&**s);
-            let s_ty = fcx.node_ty(s_id);
-            if last_was_bot && !warned && match s.node {
-                  ast::StmtDecl(decl, _) => {
-                      match decl.node {
-                          ast::DeclLocal(_) => true,
-                          _ => false,
-                      }
-                  }
-                  ast::StmtExpr(_, _) | ast::StmtSemi(_, _) => true,
-                  _ => false
-                } {
-                fcx.ccx
-                   .tcx
-                   .sess
-                   .add_lint(lint::builtin::UNREACHABLE_CODE,
-                             s_id,
-                             s.span,
-                             "unreachable statement".to_string());
-                warned = true;
+    let mut warned = false;
+    let mut last_was_bot = false;
+    let mut any_bot = false;
+    let mut any_err = false;
+    for s in blk.stmts.iter() {
+        check_stmt(fcx, &**s);
+        let s_id = ast_util::stmt_id(&**s);
+        let s_ty = fcx.node_ty(s_id);
+        if last_was_bot && !warned && match s.node {
+            ast::StmtDecl(decl, _) => {
+                match decl.node {
+                    ast::DeclLocal(_) => true,
+                    _ => false,
+                }
             }
-            if ty::type_is_bot(s_ty) {
-                last_was_bot = true;
-            }
-            any_bot = any_bot || ty::type_is_bot(s_ty);
-            any_err = any_err || ty::type_is_error(s_ty);
+            ast::StmtExpr(_, _) | ast::StmtSemi(_, _) => true,
+            _ => false
+        } {
+            fcx.ccx
+                .tcx
+                .sess
+                .add_lint(lint::builtin::UNREACHABLE_CODE,
+                          s_id,
+                          s.span,
+                          "unreachable statement".to_string());
+            warned = true;
         }
-        match blk.expr {
-            None => if any_err {
-                fcx.write_error(blk.id);
-            }
-            else if any_bot {
-                fcx.write_bot(blk.id);
-            }
-            else  {
-                fcx.write_nil(blk.id);
-            },
-          Some(e) => {
+        if ty::type_is_bot(s_ty) {
+            last_was_bot = true;
+        }
+        any_bot = any_bot || ty::type_is_bot(s_ty);
+        any_err = any_err || ty::type_is_error(s_ty);
+    }
+
+    let expr_ty = match blk.expr {
+        None => { ty::mk_nil() }
+        Some(e) => {
             if any_bot && !warned {
                 fcx.ccx
-                   .tcx
-                   .sess
-                   .add_lint(lint::builtin::UNREACHABLE_CODE,
-                             e.id,
-                             e.span,
-                             "unreachable expression".to_string());
+                    .tcx
+                    .sess
+                    .add_lint(lint::builtin::UNREACHABLE_CODE,
+                              e.id,
+                              e.span,
+                              "unreachable expression".to_string());
             }
             check_expr_with_expectation(fcx, &*e, expected);
-              let ety = fcx.expr_ty(&*e);
-              fcx.write_ty(blk.id, ety);
-              if any_err {
-                  fcx.write_error(blk.id);
-              }
-              else if any_bot {
-                  fcx.write_bot(blk.id);
-              }
-          }
-        };
-    });
+            fcx.expr_ty(&*e)
+        }
+    };
+
+    if any_err {
+        fcx.write_error(blk.id);
+    } else if any_bot {
+        fcx.write_bot(blk.id);
+    } else  {
+        fcx.write_ty(blk.id, expr_ty);
+    }
 
     *fcx.ps.borrow_mut() = prev;
 }
@@ -4735,6 +4868,9 @@ pub fn instantiate_path(fcx: &FnCtxt,
         adjust_region_parameters(fcx, span, space, region_defs, &mut substs);
         assert_eq!(substs.regions().len(space), region_defs.len(space));
     }
+
+    fcx.add_region_obligations_for_parameters(
+        span, &substs, &polytype.generics);
 
     fcx.write_ty_substs(node_id, polytype.ty, ty::ItemSubsts {
         substs: substs,
@@ -5348,3 +5484,11 @@ pub fn check_intrinsic_type(ccx: &CrateCtxt, it: &ast::ForeignItem) {
     }
 }
 
+impl Repr for RegionObligation {
+    fn repr(&self, tcx: &ty::ctxt) -> String {
+        format!("RegionObligation(sub_region={}, sup_type={}, origin={})",
+                self.sub_region.repr(tcx),
+                self.sup_type.repr(tcx),
+                self.origin.repr(tcx))
+    }
+}
