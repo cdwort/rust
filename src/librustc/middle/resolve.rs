@@ -3948,7 +3948,7 @@ impl<'a> Resolver<'a> {
                                             impl_items.as_slice());
             }
 
-            ItemTrait(ref generics, ref unbound, ref traits, ref methods) => {
+            ItemTrait(ref generics, ref unbound, ref bounds, ref methods) => {
                 // Create a new rib for the self type.
                 let self_type_rib = Rib::new(ItemRibKind);
 
@@ -3967,10 +3967,9 @@ impl<'a> Resolver<'a> {
                     this.resolve_type_parameters(&generics.ty_params);
                     this.resolve_where_clause(&generics.where_clause);
 
-                    // Resolve derived traits.
-                    for trt in traits.iter() {
-                        this.resolve_trait_reference(item.id, trt, TraitDerivation);
-                    }
+                    this.resolve_type_parameter_bounds(item.id, bounds,
+                                                       TraitDerivation);
+
                     match unbound {
                         &Some(ast::TraitTyParamBound(ref tpb)) => {
                             this.resolve_trait_reference(item.id, tpb, TraitDerivation);
@@ -4201,10 +4200,11 @@ impl<'a> Resolver<'a> {
                                type_parameters: &OwnedSlice<TyParam>) {
         for type_parameter in type_parameters.iter() {
             for bound in type_parameter.bounds.iter() {
-                self.resolve_type_parameter_bound(type_parameter.id, bound);
+                self.resolve_type_parameter_bound(type_parameter.id, bound,
+                                                  TraitBoundingTypeParameter);
             }
             match &type_parameter.unbound {
-                &Some(ref unbound) => self.resolve_type_parameter_bound(type_parameter.id, unbound),
+                &Some(ref unbound) => self.resolve_type_parameter_bound(type_parameter.id, unbound, TraitBoundingTypeParameter),
                 &None => {}
             }
             match type_parameter.default {
@@ -4214,12 +4214,23 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    fn resolve_type_parameter_bounds(&mut self,
+                                     id: NodeId,
+                                     type_parameter_bounds: &OwnedSlice<TyParamBound>,
+                                     reference_type: TraitReferenceType) {
+        for type_parameter_bound in type_parameter_bounds.iter() {
+            self.resolve_type_parameter_bound(id, type_parameter_bound,
+                                              reference_type);
+        }
+    }
+
     fn resolve_type_parameter_bound(&mut self,
                                     id: NodeId,
-                                    type_parameter_bound: &TyParamBound) {
+                                    type_parameter_bound: &TyParamBound,
+                                    reference_type: TraitReferenceType) {
         match *type_parameter_bound {
             TraitTyParamBound(ref tref) => {
-                self.resolve_trait_reference(id, tref, TraitBoundingTypeParameter)
+                self.resolve_trait_reference(id, tref, reference_type)
             }
             UnboxedFnTyParamBound(ref unboxed_function) => {
                 for argument in unboxed_function.decl.inputs.iter() {
@@ -4228,7 +4239,7 @@ impl<'a> Resolver<'a> {
 
                 self.resolve_type(&*unboxed_function.decl.output);
             }
-            StaticRegionTyParamBound | OtherRegionTyParamBound(_) => {}
+            RegionTyParamBound(..) => {}
         }
     }
 
@@ -4242,7 +4253,7 @@ impl<'a> Resolver<'a> {
                 let usage_str = match reference_type {
                     TraitBoundingTypeParameter => "bound type parameter with",
                     TraitImplementation        => "implement",
-                    TraitDerivation            => "derive"
+                    TraitDerivation            => "derive",
                 };
 
                 let msg = format!("attempt to {} a nonexistent trait `{}`", usage_str, path_str);
@@ -4297,7 +4308,8 @@ impl<'a> Resolver<'a> {
             }
 
             for bound in predicate.bounds.iter() {
-                self.resolve_type_parameter_bound(predicate.id, bound);
+                self.resolve_type_parameter_bound(predicate.id, bound,
+                                                  TraitBoundingTypeParameter);
             }
         }
     }
@@ -4681,18 +4693,14 @@ impl<'a> Resolver<'a> {
                 }
 
                 bounds.as_ref().map(|bound_vec| {
-                    for bound in bound_vec.iter() {
-                        self.resolve_type_parameter_bound(ty.id, bound);
-                    }
+                    self.resolve_type_parameter_bounds(ty.id, bound_vec,
+                                                       TraitBoundingTypeParameter);
                 });
             }
 
-            TyClosure(c, _) | TyProc(c) => {
-                c.bounds.as_ref().map(|bounds| {
-                    for bound in bounds.iter() {
-                        self.resolve_type_parameter_bound(ty.id, bound);
-                    }
-                });
+            TyClosure(c) | TyProc(c) => {
+                self.resolve_type_parameter_bounds(ty.id, &c.bounds,
+                                                   TraitBoundingTypeParameter);
                 visit::walk_ty(self, ty, ());
             }
 

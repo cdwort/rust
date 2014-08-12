@@ -303,7 +303,8 @@ fn blank_inherited_fields<'a>(ccx: &'a CrateCtxt<'a>) -> Inherited<'a> {
     // and statement context, but we might as well do write the code only once
     let param_env = ty::ParameterEnvironment {
         free_substs: subst::Substs::empty(),
-        bounds: subst::VecPerParamSpace::empty()
+        bounds: subst::VecPerParamSpace::empty(),
+        implicit_region_bound: ty::ReStatic,
     };
     Inherited::new(ccx.tcx, param_env)
 }
@@ -955,9 +956,6 @@ fn compare_impl_method(tcx: &ty::ctxt,
         return;
     }
 
-    let it = trait_m.generics.types.get_slice(subst::FnSpace).iter()
-        .zip(impl_m.generics.types.get_slice(subst::FnSpace).iter());
-
     // This code is best explained by example. Consider a trait:
     //
     //     trait Trait<T> {
@@ -1019,20 +1017,27 @@ fn compare_impl_method(tcx: &ty::ctxt,
     let impl_to_skol_substs =
         subst::Substs::new(skol_tps.clone(), skol_regions.clone());
 
-    // Compute skolemized form of impl method ty.
-    let impl_fty = ty::mk_bare_fn(tcx, impl_m.fty.clone());
-    let impl_fty = impl_fty.subst(tcx, &impl_to_skol_substs);
-
-    // Compute skolemized form of trait method ty.
+    // Create mapping from trait to skolemized.
     let trait_to_skol_substs =
         trait_to_impl_substs
         .subst(tcx, &impl_to_skol_substs)
         .with_method(Vec::from_slice(skol_tps.get_slice(subst::FnSpace)),
                      Vec::from_slice(skol_regions.get_slice(subst::FnSpace)));
-    let trait_fty = ty::mk_bare_fn(tcx, trait_m.fty.clone());
-    let trait_fty = trait_fty.subst(tcx, &trait_to_skol_substs);
+
+    // Check region bounds.
+    if !check_region_bounds_on_impl_method(tcx,
+                                           impl_m_span,
+                                           impl_m,
+                                           &trait_m.generics,
+                                           &impl_m.generics,
+                                           &trait_to_skol_substs,
+                                           &impl_to_skol_substs) {
+        return;
+    }
 
     // Check bounds.
+    let it = trait_m.generics.types.get_slice(subst::FnSpace).iter()
+        .zip(impl_m.generics.types.get_slice(subst::FnSpace).iter());
     for (i, (trait_param_def, impl_param_def)) in it.enumerate() {
         // Check that the impl does not require any builtin-bounds
         // that the trait does not guarantee:
@@ -1088,6 +1093,12 @@ fn compare_impl_method(tcx: &ty::ctxt,
         }
     }
 
+    // Compute skolemized form of impl and trait method tys.
+    let impl_fty = ty::mk_bare_fn(tcx, impl_m.fty.clone());
+    let impl_fty = impl_fty.subst(tcx, &impl_to_skol_substs);
+    let trait_fty = ty::mk_bare_fn(tcx, trait_m.fty.clone());
+    let trait_fty = trait_fty.subst(tcx, &trait_to_skol_substs);
+
     // Check the impl method type IM is a subtype of the trait method
     // type TM. To see why this makes sense, think of a vtable. The
     // expected type of the function pointers in the vtable is the
@@ -1112,6 +1123,152 @@ fn compare_impl_method(tcx: &ty::ctxt,
     // Finally, resolve all regions. This catches wily misuses of lifetime
     // parameters.
     infcx.resolve_regions_and_report_errors();
+
+    fn check_region_bounds_on_impl_method(tcx: &ty::ctxt,
+                                          span: Span,
+                                          impl_m: &ty::Method,
+                                          trait_generics: &ty::Generics,
+                                          impl_generics: &ty::Generics,
+                                          trait_to_skol_substs: &Substs,
+                                          impl_to_skol_substs: &Substs)
+                                          -> bool
+    {
+        /*!
+
+        Check that region bounds on impl method are the same as those
+        on the trait. In principle, it could be ok for there to be
+        fewer region bounds on the impl method, but this leads to an
+        annoying corner case that is painful to handle (described
+        below), so for now we can just forbid it.
+
+        Example (see
+        `src/test/compile-fail/regions-bound-missing-bound-in-impl.rs`):
+
+            trait Foo<'a> {
+                fn method1<'b>();
+                fn method2<'b:'a>();
+            }
+
+            impl<'a> Foo<'a> for ... {
+                fn method1<'b:'a>() { .. case 1, definitely bad .. }
+                fn method2<'b>() { .. case 2, could be ok .. }
+            }
+
+        The "definitely bad" case is case #1. Here, the impl adds an
+        extra constraint not present in the trait.
+
+        The "maybe bad" case is case #2. Here, the impl adds an extra
+        constraint not present in the trait. We could in principle
+        allow this, but it interacts in a complex way with early/late
+        bound resolution of lifetimes. Basically the presence or
+        absence of a lifetime bound affects whether the lifetime is
+        early/late bound, and right now the code breaks if the trait
+        has an early bound lifetime parameter and the method does not.
+
+        */
+
+        let trait_params = trait_generics.regions.get_slice(subst::FnSpace);
+        let impl_params = impl_generics.regions.get_slice(subst::FnSpace);
+
+        debug!("check_region_bounds_on_impl_method: \
+               trait_generics={} \
+               impl_generics={}",
+               trait_generics.repr(tcx),
+               impl_generics.repr(tcx));
+
+        // Must have same number of early-bound lifetime parameters.
+        // Unfortunately, if the user screws up the bounds, then this
+        // will change classification between early and late.  E.g.,
+        // if in trait we have `<'a,'b:'a>`, and in impl we just have
+        // `<'a,'b>`, then we have 2 early-bound lifetime parameters
+        // in trait but 0 in the impl. But if we report "expected 2
+        // but found 0" it's confusing, because it looks like there
+        // are zero. Since I don't quite know how to phrase things at
+        // the moment, give a kind of vague error message.
+        if trait_params.len() != impl_params.len() {
+            tcx.sess.span_err(
+                span,
+                format!("lifetime parameters or bounds on method `{}` do \
+                         not match the trait declaration",
+                        token::get_ident(impl_m.ident)).as_slice());
+            return false;
+        }
+
+        // Each parameter `'a:'b+'c+'d` in trait should have the same
+        // set of bounds in the impl, after subst.
+        for (trait_param, impl_param) in
+            trait_params.iter().zip(
+                impl_params.iter())
+        {
+            let trait_bounds =
+                trait_param.bounds.subst(tcx, trait_to_skol_substs);
+            let impl_bounds =
+                impl_param.bounds.subst(tcx, impl_to_skol_substs);
+
+            debug!("check_region_bounds_on_impl_method: \
+                   trait_param={} \
+                   impl_param={} \
+                   trait_bounds={} \
+                   impl_bounds={}",
+                   trait_param.repr(tcx),
+                   impl_param.repr(tcx),
+                   trait_bounds.repr(tcx),
+                   impl_bounds.repr(tcx));
+
+            // Collect the set of bounds present in trait but not in
+            // impl.
+            let missing: Vec<ty::Region> =
+                trait_bounds.iter()
+                .filter(|&b| !impl_bounds.contains(b))
+                .map(|&b| b)
+                .collect();
+
+            // Collect set present in impl but not in trait.
+            let extra: Vec<ty::Region> =
+                impl_bounds.iter()
+                .filter(|&b| !trait_bounds.contains(b))
+                .map(|&b| b)
+                .collect();
+
+            debug!("missing={} extra={}",
+                   missing.repr(tcx), extra.repr(tcx));
+
+            let err = if missing.len() != 0 || extra.len() != 0 {
+                tcx.sess.span_err(
+                    span,
+                    format!(
+                        "the lifetime parameter `{}` declared in the impl \
+                         has a distinct set of bounds \
+                         from its counterpart `{}` \
+                         declared in the trait",
+                        impl_param.name.user_string(tcx),
+                        trait_param.name.user_string(tcx)).as_slice());
+                true
+            } else {
+                false
+            };
+
+            if missing.len() != 0 {
+                tcx.sess.span_note(
+                    span,
+                    format!("the impl is missing the following bounds: `{}`",
+                            missing.user_string(tcx)).as_slice());
+            }
+
+            if extra.len() != 0 {
+                tcx.sess.span_note(
+                    span,
+                    format!("the impl has the following extra bounds: `{}`",
+                            extra.user_string(tcx)).as_slice());
+            }
+
+            if err {
+                return false;
+            }
+        }
+
+        return true;
+    }
 }
 
 fn check_cast(fcx: &FnCtxt,
@@ -1141,6 +1298,7 @@ fn check_cast(fcx: &FnCtxt,
         fcx.write_error(id);
         return
     }
+
     if ty::type_is_bot(t_e) {
         fcx.write_bot(id);
         return
@@ -1297,6 +1455,10 @@ impl<'a> FnCtxt<'a> {
 }
 
 impl<'a> RegionScope for infer::InferCtxt<'a> {
+    fn default_region_bound(&self, span: Span) -> Option<ty::Region> {
+        Some(self.next_region_var(infer::MiscVariable(span)))
+    }
+
     fn anon_regions(&self, span: Span, count: uint)
                     -> Result<Vec<ty::Region> , ()> {
         Ok(Vec::from_fn(count, |_| {
@@ -2641,17 +2803,19 @@ fn check_expr_with_unifier(fcx: &FnCtxt,
                              kind: ast::UnboxedClosureKind,
                              decl: &ast::FnDecl,
                              body: ast::P<ast::Block>) {
-        // The `RegionTraitStore` is a lie, but we ignore it so it doesn't
-        // matter.
-        //
-        // FIXME(pcwalton): Refactor this API.
         let mut fn_ty = astconv::ty_of_closure(
             fcx,
             expr.id,
             ast::NormalFn,
             ast::Many,
-            ty::empty_builtin_bounds(),
+
+            // The `RegionTraitStore` and region_existential_bounds
+            // are lies, but we ignore them so it doesn't matter.
+            //
+            // FIXME(pcwalton): Refactor this API.
+            ty::region_existential_bound(ty::ReStatic),
             ty::RegionTraitStore(ty::ReStatic, ast::MutImmutable),
+
             decl,
             abi::RustCall,
             None);
@@ -2739,13 +2903,17 @@ fn check_expr_with_unifier(fcx: &FnCtxt,
                 }
                 _ => {
                     // Not an error! Means we're inferring the closure type
-                    let mut bounds = ty::empty_builtin_bounds();
-                    let onceness = match expr.node {
+                    let (bounds, onceness) = match expr.node {
                         ast::ExprProc(..) => {
-                            bounds.add(ty::BoundSend);
-                            ast::Once
+                            let mut bounds = ty::region_existential_bound(ty::ReStatic);
+                            bounds.builtin_bounds.add(ty::BoundSend); // FIXME
+                            (bounds, ast::Once)
                         }
-                        _ => ast::Many
+                        _ => {
+                            let region = fcx.infcx().next_region_var(
+                                infer::AddrOfRegion(expr.span));
+                            (ty::region_existential_bound(region), ast::Many)
+                        }
                     };
                     (None, onceness, bounds)
                 }
@@ -4876,11 +5044,13 @@ pub fn check_intrinsic_type(ccx: &CrateCtxt, it: &ast::ForeignItem) {
                   Ok(t) => t,
                   Err(s) => { tcx.sess.span_fatal(it.span, s.as_slice()); }
               };
-              let region = ty::ReLateBound(it.id, ty::BrAnon(0));
-              let visitor_object_ty = match ty::visitor_object_ty(tcx, region) {
-                  Ok((_, vot)) => vot,
-                  Err(s) => { tcx.sess.span_fatal(it.span, s.as_slice()); }
-              };
+              let region0 = ty::ReLateBound(it.id, ty::BrAnon(0));
+              let region1 = ty::ReLateBound(it.id, ty::BrAnon(1));
+              let visitor_object_ty =
+                    match ty::visitor_object_ty(tcx, region0, region1) {
+                        Ok((_, vot)) => vot,
+                        Err(s) => { tcx.sess.span_fatal(it.span, s.as_slice()); }
+                    };
 
               let td_ptr = ty::mk_ptr(ccx.tcx, ty::mt {
                   ty: tydesc_ty,

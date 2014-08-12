@@ -264,7 +264,7 @@ pub enum AutoAdjustment {
     AutoAddEnv(ty::TraitStore),
     AutoDerefRef(AutoDerefRef),
     AutoObject(ty::TraitStore,
-               ty::BuiltinBounds,
+               ty::ExistentialBounds,
                ast::DefId, /* Trait ID */
                subst::Substs /* Trait substitutions */)
 }
@@ -515,7 +515,7 @@ pub struct ClosureTy {
     pub fn_style: ast::FnStyle,
     pub onceness: ast::Onceness,
     pub store: TraitStore,
-    pub bounds: BuiltinBounds,
+    pub bounds: ExistentialBounds,
     pub sig: FnSig,
     pub abi: abi::Abi,
 }
@@ -814,7 +814,7 @@ pub enum sty {
 pub struct TyTrait {
     pub def_id: DefId,
     pub substs: Substs,
-    pub bounds: BuiltinBounds
+    pub bounds: ExistentialBounds
 }
 
 #[deriving(PartialEq, Eq, Hash, Show)]
@@ -877,10 +877,23 @@ pub enum type_err {
     terr_variadic_mismatch(expected_found<bool>)
 }
 
-#[deriving(PartialEq, Eq, Hash, Show)]
+/// Bounds suitable for a named type parameter like `A` in `fn foo<A>`
+/// as well as the existential type parameter in an object type.
+#[deriving(PartialEq, Eq, Hash, Clone, Show)]
 pub struct ParamBounds {
+    pub opt_region_bound: Option<ty::Region>,
     pub builtin_bounds: BuiltinBounds,
     pub trait_bounds: Vec<Rc<TraitRef>>
+}
+
+/// Bounds suitable for an existentially quantified type parameter
+/// such as those that appear in object types or closure types. The
+/// major difference between this case and `ParamBounds` is that
+/// general purpose trait bounds are omitted.
+#[deriving(PartialEq, Eq, Hash, Clone, Show)]
+pub struct ExistentialBounds {
+    pub region_bound: ty::Region,
+    pub builtin_bounds: BuiltinBounds
 }
 
 pub type BuiltinBounds = EnumSet<BuiltinBound>;
@@ -888,7 +901,6 @@ pub type BuiltinBounds = EnumSet<BuiltinBound>;
 #[deriving(Clone, Encodable, PartialEq, Eq, Decodable, Hash, Show)]
 #[repr(uint)]
 pub enum BuiltinBound {
-    BoundStatic,
     BoundSend,
     BoundSized,
     BoundCopy,
@@ -901,11 +913,19 @@ pub fn empty_builtin_bounds() -> BuiltinBounds {
 
 pub fn all_builtin_bounds() -> BuiltinBounds {
     let mut set = EnumSet::empty();
-    set.add(BoundStatic);
     set.add(BoundSend);
     set.add(BoundSized);
     set.add(BoundSync);
     set
+}
+
+pub fn region_existential_bound(r: ty::Region) -> ExistentialBounds {
+    /*!
+     * An existential bound that does not implement any traits.
+     */
+
+    ty::ExistentialBounds { region_bound: r,
+                            builtin_bounds: empty_builtin_bounds() }
 }
 
 impl CLike for BuiltinBound {
@@ -1023,8 +1043,8 @@ pub struct TypeParameterDef {
     pub def_id: ast::DefId,
     pub space: subst::ParamSpace,
     pub index: uint,
-    pub bounds: Rc<ParamBounds>,
-    pub default: Option<ty::t>
+    pub bounds: ParamBounds,
+    pub default: Option<ty::t>,
 }
 
 #[deriving(Encodable, Decodable, Clone, Show)]
@@ -1033,6 +1053,7 @@ pub struct RegionParameterDef {
     pub def_id: ast::DefId,
     pub space: subst::ParamSpace,
     pub index: uint,
+    pub bounds: Vec<ty::Region>,
 }
 
 /// Information about the type/lifetime parameters associated with an
@@ -1080,6 +1101,12 @@ pub struct ParameterEnvironment {
 
     /// Bounds on the various type parameters
     pub bounds: VecPerParamSpace<ParamBounds>,
+
+    /// Each type parameter has an implicit region bound that
+    /// indicates it must outlive at least the function body (the user
+    /// may specify stronger requirements). This field indicates the
+    /// region of the callee.
+    pub implicit_region_bound: ty::Region,
 }
 
 impl ParameterEnvironment {
@@ -1174,7 +1201,7 @@ pub struct Polytype {
 /// As `Polytype` but for a trait ref.
 pub struct TraitDef {
     pub generics: Generics,
-    pub bounds: BuiltinBounds,
+    pub bounds: ParamBounds,
     pub trait_ref: Rc<ty::TraitRef>,
 }
 
@@ -1322,6 +1349,9 @@ pub fn mk_t(cx: &ctxt, st: sty) -> t {
         }
         return f;
     }
+    fn flags_for_bounds(bounds: &ExistentialBounds) -> uint {
+        rflags(bounds.region_bound)
+    }
     match &st {
       &ty_nil | &ty_bool | &ty_char | &ty_int(_) | &ty_float(_) | &ty_uint(_) |
       &ty_str => {}
@@ -1346,8 +1376,9 @@ pub fn mk_t(cx: &ctxt, st: sty) -> t {
       &ty_enum(_, ref substs) | &ty_struct(_, ref substs) => {
           flags |= sflags(substs);
       }
-      &ty_trait(box ty::TyTrait { ref substs, .. }) => {
+      &ty_trait(box ty::TyTrait { ref substs, ref bounds, .. }) => {
           flags |= sflags(substs);
+          flags |= flags_for_bounds(bounds);
       }
       &ty_box(tt) | &ty_uniq(tt) => {
         flags |= get(tt).flags
@@ -1377,6 +1408,7 @@ pub fn mk_t(cx: &ctxt, st: sty) -> t {
         flags |= get(f.sig.output).flags;
         // T -> _|_ is *not* _|_ !
         flags &= !(has_ty_bot as uint);
+        flags |= flags_for_bounds(&f.bounds);
       }
     }
 
@@ -1574,8 +1606,8 @@ pub fn mk_ctor_fn(cx: &ctxt,
 pub fn mk_trait(cx: &ctxt,
                 did: ast::DefId,
                 substs: Substs,
-                bounds: BuiltinBounds)
-             -> t {
+                bounds: ExistentialBounds)
+                -> t {
     // take a copy of substs so that we own the vectors inside
     let inner = box TyTrait {
         def_id: did,
@@ -1660,6 +1692,27 @@ pub fn walk_regions_and_ty(cx: &ctxt, ty: t, fldr: |r: Region|, fldt: |t: t|)
     ty_fold::RegionFolder::general(cx,
                                    |r| { fldr(r); r },
                                    |t| { fldt(t); t }).fold_ty(ty)
+}
+
+impl ParamTy {
+    pub fn new(space: subst::ParamSpace,
+               index: uint,
+               def_id: ast::DefId)
+               -> ParamTy {
+        ParamTy { space: space, idx: index, def_id: def_id }
+    }
+
+    pub fn for_self(trait_def_id: ast::DefId) -> ParamTy {
+        ParamTy::new(subst::SelfSpace, 0, trait_def_id)
+    }
+
+    pub fn for_def(def: &TypeParameterDef) -> ParamTy {
+        ParamTy::new(def.space, def.index, def.def_id)
+    }
+
+    pub fn to_ty(self, tcx: &ty::ctxt) -> ty::t {
+        ty::mk_param(tcx, self.space, self.idx, self.def_id)
+    }
 }
 
 impl ItemSubsts {
@@ -1977,9 +2030,6 @@ def_type_content_sets!(
         //       that it neither reaches nor owns a managed pointer.
         Nonsendable                         = 0b0000_0111__0000_0100__0000,
 
-        // Things that prevent values from being considered 'static
-        Nonstatic                           = 0b0000_0010__0000_0000__0000,
-
         // Things that prevent values from being considered sized
         Nonsized                            = 0b0000_0000__0000_0000__0001,
 
@@ -2004,9 +2054,8 @@ def_type_content_sets!(
 )
 
 impl TypeContents {
-    pub fn meets_bound(&self, cx: &ctxt, bb: BuiltinBound) -> bool {
+    pub fn meets_builtin_bound(&self, cx: &ctxt, bb: BuiltinBound) -> bool {
         match bb {
-            BoundStatic => self.is_static(cx),
             BoundSend => self.is_sendable(cx),
             BoundSized => self.is_sized(cx),
             BoundCopy => self.is_copy(cx),
@@ -2020,10 +2069,6 @@ impl TypeContents {
 
     pub fn intersects(&self, tc: TypeContents) -> bool {
         (self.bits & tc.bits) != 0
-    }
-
-    pub fn is_static(&self, _: &ctxt) -> bool {
-        !self.intersects(TC::Nonstatic)
     }
 
     pub fn is_sendable(&self, _: &ctxt) -> bool {
@@ -2132,10 +2177,6 @@ impl fmt::Show for TypeContents {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "TypeContents({:t})", self.bits)
     }
-}
-
-pub fn type_is_static(cx: &ctxt, t: ty::t) -> bool {
-    type_contents(cx, t).is_static(cx)
 }
 
 pub fn type_is_sendable(cx: &ctxt, t: ty::t) -> bool {
@@ -2288,9 +2329,10 @@ pub fn type_contents(cx: &ctxt, ty: t) -> TypeContents {
 
                 let ty_param_defs = cx.ty_param_defs.borrow();
                 let tp_def = ty_param_defs.get(&p.def_id.node);
-                kind_bounds_to_contents(cx,
-                                        tp_def.bounds.builtin_bounds,
-                                        tp_def.bounds.trait_bounds.as_slice())
+                kind_bounds_to_contents(
+                    cx,
+                    tp_def.bounds.builtin_bounds,
+                    tp_def.bounds.trait_bounds.as_slice())
             }
 
             ty_infer(_) => {
@@ -2377,10 +2419,10 @@ pub fn type_contents(cx: &ctxt, ty: t) -> TypeContents {
     }
 
     fn object_contents(cx: &ctxt,
-                       bounds: BuiltinBounds)
+                       bounds: ExistentialBounds)
                        -> TypeContents {
         // These are the type contents of the (opaque) interior
-        kind_bounds_to_contents(cx, bounds, [])
+        kind_bounds_to_contents(cx, bounds.builtin_bounds, [])
     }
 
     fn kind_bounds_to_contents(cx: &ctxt,
@@ -2391,7 +2433,6 @@ pub fn type_contents(cx: &ctxt, ty: t) -> TypeContents {
         let mut tc = TC::All;
         each_inherited_builtin_bound(cx, bounds, traits, |bound| {
             tc = tc - match bound {
-                BoundStatic => TC::Nonstatic,
                 BoundSend => TC::Nonsendable,
                 BoundSized => TC::Nonsized,
                 BoundCopy => TC::Noncopy,
@@ -2412,7 +2453,7 @@ pub fn type_contents(cx: &ctxt, ty: t) -> TypeContents {
 
             each_bound_trait_and_supertraits(cx, traits, |trait_ref| {
                 let trait_def = lookup_trait_def(cx, trait_ref.def_id);
-                for bound in trait_def.bounds.iter() {
+                for bound in trait_def.bounds.builtin_bounds.iter() {
                     f(bound);
                 }
                 true
@@ -3020,16 +3061,19 @@ pub fn adjust_ty(cx: &ctxt,
                 AutoAddEnv(store) => {
                     match ty::get(unadjusted_ty).sty {
                         ty::ty_bare_fn(ref b) => {
+                            let bounds = ty::ExistentialBounds {
+                                region_bound: ReStatic,
+                                builtin_bounds: all_builtin_bounds(),
+                            };
+
                             ty::mk_closure(
                                 cx,
-                                ty::ClosureTy {
-                                    fn_style: b.fn_style,
-                                    onceness: ast::Many,
-                                    store: store,
-                                    bounds: ty::all_builtin_bounds(),
-                                    sig: b.sig.clone(),
-                                    abi: b.abi,
-                                })
+                                ty::ClosureTy {fn_style: b.fn_style,
+                                               onceness: ast::Many,
+                                               store: store,
+                                               bounds: bounds,
+                                               sig: b.sig.clone(),
+                                               abi: b.abi})
                         }
                         ref b => {
                             cx.sess.bug(
@@ -3820,9 +3864,12 @@ pub fn trait_ref_to_def_id(tcx: &ctxt, tr: &ast::TraitRef) -> ast::DefId {
     def.def_id()
 }
 
-pub fn try_add_builtin_trait(tcx: &ctxt,
-                             trait_def_id: ast::DefId,
-                             builtin_bounds: &mut BuiltinBounds) -> bool {
+pub fn try_add_builtin_trait(
+    tcx: &ctxt,
+    trait_def_id: ast::DefId,
+    builtin_bounds: &mut EnumSet<BuiltinBound>)
+    -> bool
+{
     //! Checks whether `trait_ref` refers to one of the builtin
     //! traits, like `Send`, and adds the corresponding
     //! bound to the set `builtin_bounds` if so. Returns true if `trait_ref`
@@ -4185,14 +4232,10 @@ pub fn lookup_field_type(tcx: &ctxt,
         node_id_to_type(tcx, id.node)
     } else {
         let mut tcache = tcx.tcache.borrow_mut();
-        match tcache.find(&id) {
-           Some(&Polytype {ty, ..}) => ty,
-           None => {
-               let tpt = csearch::get_field_type(tcx, struct_id, id);
-               tcache.insert(id, tpt.clone());
-               tpt.ty
-           }
-        }
+        let pty = tcache.find_or_insert_with(id, |_| {
+            csearch::get_field_type(tcx, struct_id, id)
+        });
+        pty.ty
     };
     t.subst(tcx, substs)
 }
@@ -4556,7 +4599,10 @@ pub fn get_opaque_ty(tcx: &ctxt) -> Result<t, String> {
 }
 
 pub fn visitor_object_ty(tcx: &ctxt,
-                         region: ty::Region) -> Result<(Rc<TraitRef>, t), String> {
+                         ptr_region: ty::Region,
+                         trait_region: ty::Region)
+                         -> Result<(Rc<TraitRef>, t), String>
+{
     let trait_lang_item = match tcx.lang_items.require(TyVisitorTraitLangItem) {
         Ok(id) => id,
         Err(s) => { return Err(s); }
@@ -4564,11 +4610,12 @@ pub fn visitor_object_ty(tcx: &ctxt,
     let substs = Substs::empty();
     let trait_ref = Rc::new(TraitRef { def_id: trait_lang_item, substs: substs });
     Ok((trait_ref.clone(),
-        mk_rptr(tcx, region, mt {mutbl: ast::MutMutable,
-                                 ty: mk_trait(tcx,
-                                              trait_ref.def_id,
-                                              trait_ref.substs.clone(),
-                                              empty_builtin_bounds()) })))
+        mk_rptr(tcx, ptr_region,
+                mt {mutbl: ast::MutMutable,
+                    ty: mk_trait(tcx,
+                                 trait_ref.def_id,
+                                 trait_ref.substs.clone(),
+                                 ty::region_existential_bound(trait_region))})))
 }
 
 pub fn item_variances(tcx: &ctxt, item_id: ast::DefId) -> Rc<ItemVariances> {
@@ -4962,6 +5009,18 @@ pub fn construct_parameter_environment(
                               generics.types.get_slice(space));
     }
 
+    //
+    // Compute region bounds. For now, these relations are stored in a
+    // global table on the tcx, so just enter them there. I'm not
+    // crazy about this scheme, but it's convenient, at least.
+    //
+
+    for &space in subst::ParamSpace::all().iter() {
+        record_region_bounds_from_defs(tcx, space, &free_substs,
+                                       generics.regions.get_slice(space));
+    }
+
+
     debug!("construct_parameter_environment: free_id={} \
            free_subst={} \
            bounds={}",
@@ -4971,7 +5030,8 @@ pub fn construct_parameter_environment(
 
     return ty::ParameterEnvironment {
         free_substs: free_substs,
-        bounds: bounds
+        bounds: bounds,
+        implicit_region_bound: ty::ReScope(free_id),
     };
 
     fn push_region_params(regions: &mut VecPerParamSpace<ty::Region>,
@@ -5000,8 +5060,39 @@ pub fn construct_parameter_environment(
                              free_substs: &subst::Substs,
                              defs: &[TypeParameterDef]) {
         for def in defs.iter() {
-            let b = (*def.bounds).subst(tcx, free_substs);
+            let b = def.bounds.subst(tcx, free_substs);
             bounds.push(space, b);
+        }
+    }
+
+    fn record_region_bounds_from_defs(tcx: &ty::ctxt,
+                                      space: subst::ParamSpace,
+                                      free_substs: &subst::Substs,
+                                      defs: &[RegionParameterDef]) {
+        for (subst_region, def) in
+            free_substs.regions().get_slice(space).iter().zip(
+                defs.iter())
+        {
+            // For each region parameter 'subst...
+            let bounds = def.bounds.subst(tcx, free_substs);
+            for bound_region in bounds.iter() {
+                // Which is declared with a bound like 'subst:'bound...
+                match (subst_region, bound_region) {
+                    (&ty::ReFree(subst_fr), &ty::ReFree(bound_fr)) => {
+                        // Record that 'subst outlives 'bound. Or, put
+                        // another way, 'bound <= 'subst.
+                        tcx.region_maps.relate_free_regions(bound_fr, subst_fr);
+                    },
+                    _ => {
+                        // All named regions are instantiated with free regions.
+                        tcx.sess.bug(
+                            format!("push_region_bounds_from_defs: \
+                                     non free region: {} / {}",
+                                    subst_region.repr(tcx),
+                                    bound_region.repr(tcx)).as_slice());
+                    }
+                }
+            }
         }
     }
 }
