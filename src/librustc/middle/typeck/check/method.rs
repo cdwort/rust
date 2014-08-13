@@ -87,7 +87,6 @@ use middle::ty;
 use middle::typeck::astconv::AstConv;
 use middle::typeck::check::{FnCtxt, PreferMutLvalue, impl_self_ty};
 use middle::typeck::check;
-use middle::typeck::infer::MiscVariable;
 use middle::typeck::infer;
 use middle::typeck::MethodCallee;
 use middle::typeck::{MethodOrigin, MethodParam};
@@ -536,15 +535,13 @@ impl<'a> LookupContext<'a> {
         };
 
         let vcx = self.fcx.vtable_context();
-        let region_params =
-            vec!(vcx.infcx.next_region_var(MiscVariable(self.span)));
 
         // Get the tupled type of the arguments.
         let arguments_type = *closure_function_type.sig.inputs.get(0);
         let return_type = closure_function_type.sig.output;
 
         let closure_region =
-            vcx.infcx.next_region_var(MiscVariable(self.span));
+            vcx.infcx.next_region_var(infer::MiscVariable(self.span));
         let unboxed_closure_type = ty::mk_unboxed_closure(self.tcx(),
                                                           closure_did,
                                                           closure_region);
@@ -553,7 +550,7 @@ impl<'a> LookupContext<'a> {
                 RcvrMatchesIfSubtype(unboxed_closure_type),
             rcvr_substs: subst::Substs::new_trait(
                 vec![arguments_type, return_type],
-                region_params,
+                vec![],
                 *vcx.infcx.next_ty_vars(1).get(0)),
             method_ty: method,
             origin: MethodStaticUnboxedClosure(closure_did),
