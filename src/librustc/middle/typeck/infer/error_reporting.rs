@@ -90,9 +90,12 @@ use syntax::owned_slice::OwnedSlice;
 use syntax::codemap;
 use syntax::parse::token;
 use syntax::print::pprust;
-use util::ppaux::{UserString}; // do not import Repr, shouldn't be calling it!
 use util::ppaux::bound_region_to_string;
 use util::ppaux::note_and_explain_region;
+
+// Note: only import UserString, not Repr, since user-facing error
+// messages shouldn't include debug serializations.
+use util::ppaux::UserString;
 
 pub trait ErrorReporting {
     fn report_region_errors(&self,

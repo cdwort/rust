@@ -481,7 +481,7 @@ impl Clean<TyParam> for ty::TypeParameterDef {
 
 #[deriving(Clone, Encodable, Decodable, PartialEq)]
 pub enum TyParamBound {
-    RegionBound,
+    RegionBound, // FIXME(#16518) -- need to include name of actual region
     TraitBound(Type)
 }
 
@@ -500,8 +500,7 @@ impl Clean<TyParamBound> for ast::TyParamBound {
 
 impl Clean<Vec<TyParamBound>> for ty::ExistentialBounds {
     fn clean(&self) -> Vec<TyParamBound> {
-        let mut vec = Vec::new();
-        vec.push(RegionBound);
+        let mut vec = vec!(RegionBound);
         for bb in self.builtin_bounds.iter() {
             vec.push(bb.clean());
         }

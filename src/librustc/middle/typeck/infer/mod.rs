@@ -180,7 +180,8 @@ pub enum SubregionOrigin {
     // that must outlive some other region.
     RelateRegionParamBound(Span),
 
-    //
+    // A bound placed on type parameters that states that must outlive
+    // the moment of their instantiation.
     RelateDefaultParamBound(Span, ty::t),
 
     // Creating a pointer `b` to contents of another reference
